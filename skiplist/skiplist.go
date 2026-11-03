@@ -3,6 +3,7 @@ package skiplist
 import (
 	"bytes"
 	"math/rand/v2"
+	"sync"
 )
 
 const p = 0.5
@@ -34,6 +35,7 @@ func randomLevel() int {
 type SkipList struct {
 	head  *Node
 	level int
+	mu    sync.RWMutex
 }
 
 func NewSkipList() *SkipList {
@@ -44,26 +46,25 @@ func NewSkipList() *SkipList {
 	return &skipList
 }
 
-func (sl *SkipList) Search(key []byte) []byte {
+func (sl *SkipList) Search(key []byte) ([]byte, bool) {
+	sl.mu.RLock()
+	defer sl.mu.RUnlock()
 	currNode := sl.head
-
 	for i := sl.level - 1; i >= 0; i-- {
 		for currNode.next[i] != nil && bytes.Compare(currNode.next[i].key, key) == -1 {
 			currNode = currNode.next[i]
 		}
 	}
-
-	if n := currNode.next[0]; n != nil && bytes.Compare(n.key, key) == 0 {
-		return n.value
+	if n := currNode.next[0]; n != nil && bytes.Equal(n.key, key) {
+		return n.value, true
 	}
-
-	return nil
+	return nil, false
 }
 
-func (sl *SkipList) Insert(key, value []byte) {
-
+func (sl *SkipList) Insert(key, value []byte) (size int64) {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
 	var update [MAX_LEVEL]*Node // predecessor nodes for new node
-
 	currNode := sl.head
 
 	for i := sl.level - 1; i >= 0; i-- {
@@ -73,9 +74,10 @@ func (sl *SkipList) Insert(key, value []byte) {
 		update[i] = currNode
 	}
 
-	if currNode.next[0] != nil && bytes.Compare(currNode.next[0].key, key) == 0 {
-		currNode.next[0].value = value
-		return
+	if n := currNode.next[0]; n != nil && bytes.Equal(n.key, key) {
+		oldVal := int64(len(n.value))
+		n.value = value
+		return int64(len(value)) - oldVal
 	}
 
 	height := randomLevel()
@@ -85,15 +87,16 @@ func (sl *SkipList) Insert(key, value []byte) {
 		}
 		sl.level = height
 	}
-	newNode := *NewNode(key, value, height)
+	newNode := NewNode(key, value, height)
 	for i := 0; i < height; i++ {
 		newNode.next[i] = update[i].next[i]
-		update[i].next[i] = &newNode
+		update[i].next[i] = newNode
 	}
-
+	return int64(len(key)) + int64(len(value))
 }
 
-func (sl *SkipList) Delete(key []byte) bool {
+func (sl *SkipList) Delete(key []byte) (size int64) {
+	sl.mu.Lock()
 	currNode := sl.head
 	keyFound := false
 	for i := sl.level - 1; i >= 0; i-- {
@@ -101,15 +104,18 @@ func (sl *SkipList) Delete(key []byte) bool {
 			currNode = currNode.next[i]
 		}
 
-		if n := currNode.next[i]; n != nil && bytes.Compare(n.key, key) == 0 {
-			currNode.next[i] = n.next[i]
-			keyFound = true
+		if n := currNode.next[i]; n != nil && bytes.Equal(n.key, key) {
+			if !keyFound {
+				keyFound = true
+				size -= int64(len(n.value))
+			}
+			n.value = nil
 		}
 	}
+	sl.mu.Unlock()
+	if !keyFound {
+		size = sl.Insert(key, nil)
 
-	//update the skiplist level
-	for sl.level > 1 && sl.head.next[sl.level-1] == nil {
-		sl.level--
 	}
-	return keyFound
+	return size
 }
