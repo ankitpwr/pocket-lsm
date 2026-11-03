@@ -1,0 +1,3 @@
+module github.com/ankitpwr/pocket-lsm
+
+go 1.27.1
