@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type WAL struct {
@@ -16,6 +17,7 @@ type WAL struct {
 	maxSeg         int
 	currentSegIdx  int
 	currentSeg     *os.File
+	mu             sync.Mutex
 }
 
 func NewWal(directory string, maxSeg int, maxFileSize int64) (*WAL, error) {
@@ -46,8 +48,6 @@ func NewWal(directory string, maxSeg int, maxFileSize int64) (*WAL, error) {
 		//why to close file now?
 	}
 
-	//why open file again and seek to end of the file?
-
 	filePath := filepath.Join(directory, "segment-"+strconv.Itoa(lastSegId))
 	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644) // why os append, create flag needed here?
 	if err != nil {
@@ -65,6 +65,17 @@ func NewWal(directory string, maxSeg int, maxFileSize int64) (*WAL, error) {
 	}
 
 	return wal, nil
+
+}
+
+func (wal *WAL) writeEntry(data []byte) error {
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+
+	//create new segment if current exceed
+	if err := wal.rotateSegIfNeeded(); err != nil {
+		return err
+	}
 
 }
 
@@ -94,4 +105,53 @@ func createSegmentFile(directory string, segmentId int) (*os.File, error) {
 		return nil, err
 	}
 	return file, nil
+}
+
+// check if rotation is required
+func (wal *WAL) rotateSegIfNeeded() error {
+	fileStats, err := wal.currentSeg.Stat()
+	if err != nil {
+		return err
+	}
+	//returns the number of bytes
+	if fileStats.Size()+int64(wal.bufWriter.Buffered()) >= wal.maxFileSize {
+		if err := wal.rotateSegment(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// create new log segment file
+func (wal *WAL) rotateSegment() error {
+	if err := wal.sync(); err != nil {
+		return err
+	}
+
+	if err := wal.currentSeg.Close(); err != nil {
+		return err
+	}
+
+	wal.currentSegIdx++
+	newFile, err := createSegmentFile(wal.directory, wal.currentSegIdx)
+	if err != nil {
+		return err
+	}
+	//delete old segment if segment couts > maxsegments
+	wal.currentSeg = newFile
+	wal.bufWriter = bufio.NewWriter(newFile)
+	return nil
+}
+
+func (wal *WAL) sync() error {
+	// explicitly write any accumulated in memory to the file
+	if err := wal.bufWriter.Flush(); err != nil {
+		return err
+	}
+
+	//fsync to disk
+	if err := wal.currentSeg.Sync(); err != nil {
+		return nil
+	}
+	return nil
 }
