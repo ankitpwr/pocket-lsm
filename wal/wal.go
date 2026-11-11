@@ -2,6 +2,8 @@ package wal
 
 import (
 	"bufio"
+	"encoding/binary"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,6 +22,12 @@ type WAL struct {
 	mu             sync.Mutex
 }
 
+type WAL_Entry struct {
+	logsequenceNo uint64
+	data          []byte
+	CRC           uint32
+}
+
 func NewWal(directory string, maxSeg int, maxFileSize int64) (*WAL, error) {
 	//create directory if if does not exits
 	if err := os.MkdirAll(directory, 0755); err != nil {
@@ -27,7 +35,7 @@ func NewWal(directory string, maxSeg int, maxFileSize int64) (*WAL, error) {
 	}
 
 	//search for all the logs files
-	files, err := filepath.Glob(filepath.Join(directory, "segment-"+"*"))
+	files, err := filepath.Glob(filepath.Join(directory, "segment-*"))
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +57,7 @@ func NewWal(directory string, maxSeg int, maxFileSize int64) (*WAL, error) {
 	}
 
 	filePath := filepath.Join(directory, "segment-"+strconv.Itoa(lastSegId))
-	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644) // why os append, create flag needed here?
+	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644) // why os append, create flag needed here as we already have created the file?
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +67,7 @@ func NewWal(directory string, maxSeg int, maxFileSize int64) (*WAL, error) {
 		maxSeg:         maxSeg,
 		maxFileSize:    maxFileSize,
 		currentSegIdx:  lastSegId,
-		currentSeg:     file, //why not *file?
+		currentSeg:     file,
 		bufWriter:      bufio.NewWriter(file),
 		lastSequenceNo: 0,
 	}
@@ -77,6 +85,41 @@ func (wal *WAL) writeEntry(data []byte) error {
 		return err
 	}
 
+	wal.lastSequenceNo++
+
+	//if checkpoint add it
+
+	crc := crc32.NewIEEE()
+	var lsnBuf [8]byte
+	binary.LittleEndian.PutUint64(lsnBuf[:], wal.lastSequenceNo) //Split the uint64 lastSequenceNo into 8 individual bytes
+	//feed 8-bytes and data to CRC calculator
+	crc.Write(lsnBuf[:])
+	crc.Write(data)
+
+	entry := &WAL_Entry{
+		logsequenceNo: wal.lastSequenceNo,
+		data:          data,
+		CRC:           crc.Sum32(), //produce 4 byte check-sum
+	}
+	return wal.writeToBuffer(entry)
+}
+
+func (wal *WAL) writeToBuffer(entry *WAL_Entry) error {
+	//Allocate a 16-byte slice for the fixed-size header(crc + lsn + size_of_the_data)
+	header := make([]byte, 16)
+	binary.LittleEndian.PutUint32(header[0:4], entry.CRC)
+	binary.LittleEndian.PutUint64(header[4:12], entry.logsequenceNo)
+	binary.LittleEndian.PutUint32(header[12:16], uint32(len(entry.data)))
+
+	//Copy the 16-byte header into buffer
+	if _, err := wal.bufWriter.Write(header); err != nil {
+		return err
+	}
+	//Copy data bytes into buffer
+	if _, err := wal.bufWriter.Write(entry.data); err != nil {
+		return err
+	}
+	return nil
 }
 
 // finds the highest segment ID from a list of file paths
@@ -151,7 +194,7 @@ func (wal *WAL) sync() error {
 
 	//fsync to disk
 	if err := wal.currentSeg.Sync(); err != nil {
-		return nil
+		return err
 	}
 	return nil
 }
