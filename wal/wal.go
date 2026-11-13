@@ -3,7 +3,9 @@ package wal
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -26,6 +28,7 @@ type WAL_Entry struct {
 	logsequenceNo uint64
 	data          []byte
 	CRC           uint32
+	isCheckPoint  bool
 }
 
 func NewWal(directory string, maxSeg int, maxFileSize int64) (*WAL, error) {
@@ -76,7 +79,7 @@ func NewWal(directory string, maxSeg int, maxFileSize int64) (*WAL, error) {
 
 }
 
-func (wal *WAL) writeEntry(data []byte) error {
+func (wal *WAL) writeEntry(data []byte, isCheckPoint bool) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
@@ -100,16 +103,31 @@ func (wal *WAL) writeEntry(data []byte) error {
 		logsequenceNo: wal.lastSequenceNo,
 		data:          data,
 		CRC:           crc.Sum32(), //produce 4 byte check-sum
+		isCheckPoint:  isCheckPoint,
+	}
+
+	//why to fsync when check point is true
+	if isCheckPoint {
+		if err := wal.sync(); err != nil {
+			return err
+		}
 	}
 	return wal.writeToBuffer(entry)
 }
 
 func (wal *WAL) writeToBuffer(entry *WAL_Entry) error {
 	//Allocate a 16-byte slice for the fixed-size header(crc + lsn + size_of_the_data)
-	header := make([]byte, 16)
+	header := make([]byte, 17)
 	binary.LittleEndian.PutUint32(header[0:4], entry.CRC)
 	binary.LittleEndian.PutUint64(header[4:12], entry.logsequenceNo)
 	binary.LittleEndian.PutUint32(header[12:16], uint32(len(entry.data)))
+
+	//why doent use little endian put here?
+	if entry.isCheckPoint {
+		header[16] = 1
+	} else {
+		header[16] = 0
+	}
 
 	//Copy the 16-byte header into buffer
 	if _, err := wal.bufWriter.Write(header); err != nil {
@@ -120,6 +138,88 @@ func (wal *WAL) writeToBuffer(entry *WAL_Entry) error {
 		return err
 	}
 	return nil
+}
+
+func (wal *WAL) readAll(readFromCheckpoint bool) ([]*WAL_Entry, error) {
+
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+
+	if err := wal.sync(); err != nil {
+		return nil, err
+	}
+
+	file, err := os.OpenFile(wal.currentSeg.Name(), os.O_RDONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	return readAllEntriesFromFile(file, readFromCheckpoint)
+}
+
+func readAllEntriesFromFile(file *os.File, readFromCheckpoint bool) ([]*WAL_Entry, error) {
+	var entries []*WAL_Entry
+	header := make([]byte, 17)
+
+	for {
+		//Read the 17-byte fixed header
+		if _, err := io.ReadFull(file, header); err != nil {
+
+			//cleanly reached end of file (no more entries)
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return entries, nil
+		}
+
+		crc := binary.LittleEndian.Uint32(header[0:4])
+		lsn := binary.LittleEndian.Uint64(header[4:12])
+		dataSize := binary.LittleEndian.Uint32(header[12:16])
+		isCheckpoint := header[16] == 1
+
+		data := make([]byte, dataSize)
+
+		//will it read from where we left?
+		if _, err := io.ReadFull(file, data); err != nil {
+			//entries ended halfway
+			return entries, err
+		}
+
+		entry := &WAL_Entry{
+			logsequenceNo: lsn,
+			data:          data,
+			CRC:           crc,
+			isCheckPoint:  isCheckpoint,
+		}
+
+		if !verifyCRC(entry) {
+			return entries, errors.New("wal: corrupted entry detected (CRC mismatch)")
+		}
+
+		// only entries after last checkpoint
+		if readFromCheckpoint && isCheckpoint {
+			entries = nil
+			continue
+		}
+		entries = append(entries, entry)
+
+	}
+	return entries, nil
+
+}
+
+// recalculate crc checksum and compare it with entry CRC
+func verifyCRC(entry *WAL_Entry) bool {
+	crc := crc32.NewIEEE()
+
+	var lsnBuf [8]byte
+	binary.LittleEndian.PutUint64(lsnBuf[:], entry.logsequenceNo)
+	crc.Write(lsnBuf[:])
+	crc.Write(entry.data)
+
+	actualCRC := crc.Sum32()
+	return actualCRC == entry.CRC
 }
 
 // finds the highest segment ID from a list of file paths
